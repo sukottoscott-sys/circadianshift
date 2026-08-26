@@ -1,6 +1,5 @@
-// Bump this version string any time index.html (or any cached asset) changes.
-// Changing it forces clients to fetch fresh copies instead of serving stale cache.
-const CACHE_NAME = "circadianshift-v8";
+// Network-first with cache fallback.
+const CACHE_NAME = "circadianshift-v10";
 
 const ASSETS = [
   "./",
@@ -10,44 +9,51 @@ const ASSETS = [
   "./icon-512.png",
 ];
 
+const NET_TIMEOUT = 3000;
+
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS))
-  );
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)));
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(
-        keys
-          .filter((key) => key !== CACHE_NAME)
-          .map((key) => caches.delete(key))
-      )
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
     )
   );
   self.clients.claim();
 });
 
-// Cache-first: serve from cache immediately if present (this is what makes
-// airplane-mode use instant and reliable). Fall back to network for anything
-// not yet cached, and opportunistically cache successful GET responses.
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
-
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request)
-        .then((response) => {
-          if (response && response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached);
-    })
+    (async () => {
+      const cache = await caches.open(CACHE_NAME);
+      const fromNet = (async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), NET_TIMEOUT);
+        try {
+          const res = await fetch(event.request, { signal: controller.signal });
+          clearTimeout(timer);
+          if (res && res.ok) cache.put(event.request, res.clone());
+          return res;
+        } catch (err) {
+          clearTimeout(timer);
+          throw err;
+        }
+      })();
+      try {
+        return await fromNet;
+      } catch {
+        const cached = await cache.match(event.request);
+        if (cached) return cached;
+        if (event.request.mode === "navigate") {
+          const shell = await cache.match("./index.html");
+          if (shell) return shell;
+        }
+        throw new Error("no network and no cache for " + event.request.url);
+      }
+    })()
   );
 });
