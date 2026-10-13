@@ -5,6 +5,8 @@ import { Sun, Moon, Pill, Coffee, Plane, ChevronDown, ChevronUp, EyeOff, Utensil
 const MIN = 60, DAY = 1440, HR = 3600000, MSM = 60000, DAYMS = 86400000;
 const BUF = 90;                  // meal / awake buffer (min) at each end of each flight
 const TRANSIT = 75, BOARD = 90;  // deplane + transit, and gate + boarding lead (min)
+const LANDED = 60;               // after the final landing: deplane, immigration, bags
+const PREDEP = 150;              // before each journey's first take-off: travel to airport, check-in, boarding
 
 // ---------- helpers ----------
 const mod = (x, n) => ((x % n) + n) % n;
@@ -48,6 +50,14 @@ const ALIAS = { "Asia/Ho_Chi_Minh": "saigon hanoi vietnam", "America/New_York": 
 const zoneLabel = (z) => { const parts = z.split("/"); const city = parts[parts.length - 1].replace(/_/g, " "); const region = parts.length > 1 ? parts[0].replace(/_/g, " ") : ""; return region ? `${city} (${region})` : city; };
 const fmtOff = (o) => o == null ? "" : `UTC${o >= 0 ? "+" : "-"}${Math.floor(Math.abs(o))}${Math.abs(o) % 1 ? ":" + pad(Math.round((Math.abs(o) % 1) * 60)) : ""}`;
 const cityOf = (zone, off) => zone ? zoneLabel(zone).split(" (")[0] : fmtOff(off);
+// Offset of a zone at an instant, cached per 15 min since Intl formatters are slow.
+const OFF_CACHE = new Map();
+const offAtZone = (zone, t, fallback) => {
+  if (!zone) return fallback;
+  const key = zone + "|" + Math.floor(t / (15 * 60000));
+  if (!OFF_CACHE.has(key)) { let o; try { o = zoneOffset(zone, t); } catch { o = fallback; } OFF_CACHE.set(key, o); }
+  return OFF_CACHE.get(key);
+};
 
 // ---------- persistence ----------
 // Three layers: localStorage, a persistent-storage request, and the whole setup
@@ -75,6 +85,39 @@ const DEFAULTS = {
   bed: "23:00", wake: "07:00", chrono: "intermediate",
   melatonin: true, caffeine: true, preDays: null, advRate: 1.5, delRate: 1.5,
 };
+
+// ---------- keeping trip times in order ----------
+// The journey is one chain: depart, (stopover), arrive, return depart, (stopover), return
+// arrive. When a time changes, any later time that would now fall before its predecessor
+// moves by the same amount, which keeps flight lengths and stay length intact. Later times
+// already in order are left alone, so a correct arrival is never overwritten.
+const CHAIN = [
+  ["depart", "homeOffset", null, 0], ["stopArrive", "stopOffset", "out", 6 * HR], ["stopDepart", "stopOffset", "out", 2 * HR],
+  ["arrive", "destOffset", null, 9 * HR], ["retDepart", "destOffset", "ret", 7 * DAYMS],
+  ["retStopArrive", "retStopOffset", "retStop", 6 * HR], ["retStopDepart", "retStopOffset", "retStop", 2 * HR], ["retArrive", "homeOffset", "ret", 9 * HR],
+];
+function cascadeTimes(s, key, value) {
+  const n = { ...s, [key]: value };
+  const on = { out: s.hasStop, ret: s.roundTrip, retStop: s.roundTrip && s.retHasStop };
+  const chain = CHAIN.filter((c) => !c[2] || on[c[2]]);
+  const i0 = chain.findIndex((c) => c[0] === key);
+  if (i0 < 0) return n;
+  const u = (st, c) => parseUTC(st[c[0]], st[c[1]]);
+  const delta = u(n, chain[i0]) - u(s, chain[i0]);
+  for (let i = i0 + 1; i < chain.length; i++) {
+    const prev = u(n, chain[i - 1]), cur = u(n, chain[i]);
+    if (!Number.isFinite(prev)) break;
+    if (Number.isFinite(cur) && cur > prev) continue;
+    let fix = Number.isFinite(cur) && Number.isFinite(delta) ? cur + delta : NaN;
+    if (!(fix > prev)) {
+      const oldGap = u(s, chain[i]) - u(s, chain[i - 1]);
+      const maxGap = chain[i][0] === "retDepart" ? 90 * DAYMS : 40 * HR;
+      fix = prev + (oldGap > 0 && oldGap <= maxGap ? oldGap : chain[i][3]);
+    }
+    n[chain[i][0]] = toLocalStr(fix, n[chain[i][1]]);
+  }
+  return n;
+}
 
 // ---------- model ----------
 // Clip a PRC light window to the waking period (absolute UTC ms, plain intersection).
@@ -170,7 +213,8 @@ function buildPlan(inp) {
   // corrupting the zone timeline (a stale return date used to do exactly that). ----
   let roundTrip = !!inp.roundTrip, ret = null;
   if (roundTrip) {
-    ret = buildLegs(inp.destOffset, inp.homeOffset, inp.retDepart, inp.retArrive, inp.retDelayMin,
+    const offOn = (zone, str, fb) => (zone && typeof str === "string" ? zoneOffsetForDate(zone, str.split("T")[0]) ?? fb : fb);
+    ret = buildLegs(offOn(inp.destZone, inp.retDepart, inp.destOffset), offOn(inp.homeZone, inp.retArrive, inp.homeOffset), inp.retDepart, inp.retArrive, inp.retDelayMin,
       inp.retHasStop, inp.retStopOffset, inp.retStopArrive, inp.retStopDepart);
     if (!(ret.departUTC > arriveUTC)) {
       issues.push({ where: "ret", msg: "Return departs before the outbound flight lands. Return leg ignored until the return departure is fixed." });
@@ -185,21 +229,29 @@ function buildPlan(inp) {
     if (!roundTrip) ret = null;
   }
 
-  const shift1 = computeShiftMeta(inp.homeOffset, inp.destOffset, inp.advRate, inp.delRate);
-  const { direction, total, rate, daysNeeded, crossover } = shift1;
-  const pre = headStart(direction, daysNeeded, inp.preDays);
+  // The body starts on whatever home clock is in force when the plan begins, which can
+  // differ from departure day if daylight saving changes in between.
   const depMid = Math.floor((departUTC - (inp.delayMin || 0) * MSM + inp.homeOffset * HR) / DAYMS) * DAYMS;
-  const bedAnchor1 = depMid - pre * DAYMS + bed * MSM - inp.homeOffset * HR;
+  let shift1 = computeShiftMeta(inp.homeOffset, inp.destOffset, inp.advRate, inp.delRate);
+  let pre = headStart(shift1.direction, shift1.daysNeeded, inp.preDays);
+  const baseOff = offAtZone(inp.homeZone, depMid - pre * DAYMS + 12 * HR - inp.homeOffset * HR, inp.homeOffset);
+  if (baseOff !== inp.homeOffset) {
+    shift1 = computeShiftMeta(baseOff, inp.destOffset, inp.advRate, inp.delRate);
+    pre = headStart(shift1.direction, shift1.daysNeeded, inp.preDays);
+  }
+  const { direction, total, rate, daysNeeded, crossover } = shift1;
+  const bedAnchor1 = depMid - pre * DAYMS + bed * MSM - baseOff * HR;
 
   let shift2 = null, pre2 = 0, stayDays = null, tightStay = false, ep2 = [];
   if (roundTrip) {
-    shift2 = computeShiftMeta(inp.destOffset, inp.homeOffset, inp.advRate, inp.delRate);
+    const retDestOff = offAtZone(inp.destZone, ret.departUTC, inp.destOffset);
+    shift2 = computeShiftMeta(retDestOff, offAtZone(inp.homeZone, ret.arriveUTC, inp.homeOffset), inp.advRate, inp.delRate);
     stayDays = Math.floor((ret.departUTC - arriveUTC) / DAYMS);
     const pre2Natural = headStart(shift2.direction, shift2.daysNeeded, null);
     pre2 = Math.max(0, Math.min(pre2Natural, stayDays));
     tightStay = stayDays < pre2Natural || stayDays < daysNeeded;
-    const retDepMid = Math.floor((ret.departUTC - (inp.retDelayMin || 0) * MSM + inp.destOffset * HR) / DAYMS) * DAYMS;
-    const bedAnchor2 = retDepMid - pre2 * DAYMS + bed * MSM - inp.destOffset * HR;
+    const retDepMid = Math.floor((ret.departUTC - (inp.retDelayMin || 0) * MSM + retDestOff * HR) / DAYMS) * DAYMS;
+    const bedAnchor2 = retDepMid - pre2 * DAYMS + bed * MSM - retDestOff * HR;
     ep2 = buildEpisodes({ bedAnchorUTC: bedAnchor2, nEp: pre2 + shift2.daysNeeded + 2, direction: shift2.direction, total: shift2.total, rate: shift2.rate, sleepMs, chronoAdj });
   }
   const nEp1 = roundTrip
@@ -225,10 +277,12 @@ function buildPlan(inp) {
   // ---- clock regimes: home until outbound landing, destination through the stay,
   // home again once the return lands. Every displayed time uses the regime in force
   // at that instant, which is what the clocks around you actually show. ----
-  const regimes = [{ t: -Infinity, off: inp.homeOffset, name: homeName }, { t: arriveUTC, off: inp.destOffset, name: destName }];
+  const regimes = [{ t: -Infinity, off: inp.homeOffset, name: homeName, zone: inp.homeZone }, { t: arriveUTC, off: inp.destOffset, name: destName, zone: inp.destZone }];
   if (roundTrip) regimes.push({ t: retArriveUTC, off: inp.homeOffset, name: homeName });
-  const zoneAt = (t) => { let r = regimes[0]; for (const x of regimes) if (t >= x.t) r = x; return r; };
-  const sameZ = (a, b) => a.off === b.off && a.name === b.name;
+  // Which city's clock applies is set by the flights; that city's offset at the instant
+  // comes from the IANA data, so a daylight-saving change mid-plan shows real clock times.
+  const zoneAt = (t) => { let r = regimes[0]; for (const x of regimes) if (t >= x.t) r = x; return { name: r.name, off: offAtZone(r.zone, t, r.off) }; };
+  const sameZ = (a, b) => a.name === b.name;
   const fmtAt = (t) => clockAt(t, zoneAt(t).off);
 
   const days = [], events = [];
@@ -258,7 +312,7 @@ function buildPlan(inp) {
     const cardZone = zoneAt((awakeStart + awakeEnd) / 2), endZone = zoneAt(cardEnd);
     const sfx = (t) => (sameZ(zoneAt(t), cardZone) ? null : zoneAt(t).name);
     // A range is written in one clock (the one at its start) so it never mixes zones.
-    const rng = (w) => { const o = zoneAt(w[0]).off; return `${clockAt(w[0], o)}–${clockAt(w[1], o)}`; };
+    const rng = (w) => { const a = zoneAt(w[0]), b = zoneAt(w[1]); return `${clockAt(w[0], a.off)}–${clockAt(w[1], sameZ(a, b) ? b.off : a.off)}`; };
     const rows = [];
     for (const [a, b] of legs) {
       if (a >= cardStart && a < cardEnd) rows.push({ k: "flight", t: a, v: `${fmtAt(a)} ${zoneAt(a).name} → ${fmtAt(b)} ${zoneAt(b).name}`, z: null });
@@ -286,6 +340,9 @@ function buildPlan(inp) {
   const holes = [];
   for (const [a, b] of legs) { holes.push([a, a + BUF * MSM]); holes.push([b - BUF * MSM, b]); }
   for (const g of grounds) { holes.push([g[0], g[0] + TRANSIT * MSM]); holes.push([g[1] - BOARD * MSM, g[1]]); }
+  // deplaning, immigration and getting out of the airport after each final landing
+  for (const t of [arriveUTC, retArriveUTC]) if (t != null) holes.push([t, t + LANDED * MSM]);
+  for (const t of [departUTC, retDepartUTC]) if (t != null) holes.push([t - PREDEP * MSM, t]);
   const sleepEvs = events.filter((e) => e.kind === "sleep");
   const otherEvs = events.filter((e) => e.kind !== "sleep");
   let frags = sleepEvs.map((e) => ({ ...e }));
@@ -314,7 +371,8 @@ function buildPlan(inp) {
     d.rows = d.rows.filter((r) => r.k !== "sleep");
     for (const f of keptSleep) if (f.a >= s0 && f.a < s1) {
       const z = zoneAt(f.a);
-      d.rows.push({ k: "sleep", t: f.a, v: `${clockAt(f.a, z.off)}–${clockAt(f.b, z.off)}`, z: sameZ(z, cz) ? null : z.name });
+      const zb = zoneAt(f.b);
+      d.rows.push({ k: "sleep", t: f.a, v: `${clockAt(f.a, z.off)}–${clockAt(f.b, sameZ(z, zb) ? zb.off : z.off)}`, z: sameZ(z, cz) ? null : z.name });
     }
     const first = d.rows.filter((r) => r.k === "sleep").sort((x, y) => x.t - y.t)[0];
     if (d._mela && first && first.t !== d._mela.t) {
@@ -359,7 +417,7 @@ function computeAxis(plan) {
   const heads = [], grid = [];
   const z0 = plan.zoneAt(plan.planStart);
   heads.push({ t: plan.planStart, off: z0.off, name: z0.name, kind: "start" });
-  for (const r of plan.regimes.slice(1)) if (r.t > plan.planStart && r.t < plan.planEnd) heads.push({ t: r.t, off: r.off, name: r.name, kind: "change" });
+  for (const r of plan.regimes.slice(1)) if (r.t > plan.planStart && r.t < plan.planEnd) { const z = plan.zoneAt(r.t); heads.push({ t: r.t, off: z.off, name: z.name, kind: "change" }); }
   for (let t = Math.ceil(plan.planStart / STEP) * STEP; t <= plan.planEnd; t += STEP) {
     const z = plan.zoneAt(t);
     const m = mod(Math.round(t / MSM) + Math.round(z.off * 60), DAY);
@@ -376,7 +434,7 @@ const META = {
   sleep: { l: "Sleep", c: "#a98bf0", I: Moon },
   seek: { l: "Seek bright light", c: "#f5b942", I: Sun },
   avoid: { l: "Avoid bright light", c: "#9aa3d4", I: EyeOff },
-  meal: { l: "Stay awake: meals and cabin", c: "#e08a5a", I: Utensils },
+  meal: { l: "Stay awake: flight and airport", c: "#e08a5a", I: Utensils },
   mela: { l: "Melatonin (0.5 mg) as sleep aid", c: "#5fb3f5", I: Pill },
   caff: { l: "Caffeine cutoff", c: "#c8a06a", I: Coffee },
   flight: { l: "In flight", c: "#5fb3f5", I: Plane },
@@ -587,6 +645,7 @@ export default function CircadianShift() {
     try { await navigator.clipboard.writeText(location.href); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch { setCopied(false); }
   };
   const set = (k, v) => setInp((s) => ({ ...s, [k]: v }));
+  const setTime = (k, v) => { if (v) setInp((s) => cascadeTimes(s, k, v)); };
   const pickZone = (which, z) => setInp((s) => {
     const [zk, ok, dk] = ZK[which];
     const o = zoneOffsetForDate(z, String(s[dk] || s.depart).split("T")[0]);
@@ -730,16 +789,16 @@ export default function CircadianShift() {
                 <Field label="Home city"><ZonePicker value={inp.homeZone} dateYmd={String(inp.depart).split("T")[0]} onPick={(z) => pickZone("home", z)} /></Field>
                 <Field label="Destination city"><ZonePicker value={inp.destZone} dateYmd={String(inp.arrive).split("T")[0]} onPick={(z) => pickZone("dest", z)} /></Field>
               </div>
-              <Field label={`Departure (${homeCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.depart} onChange={(e) => set("depart", e.target.value)} /></Field>
-              <Field label={`Arrival (${destCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.arrive} onChange={(e) => set("arrive", e.target.value)} /></Field>
+              <Field label={`Departure (${homeCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.depart} onChange={(e) => setTime("depart", e.target.value)} /></Field>
+              <Field label={`Arrival (${destCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.arrive} onChange={(e) => setTime("arrive", e.target.value)} /></Field>
               <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
                 <input type="checkbox" checked={inp.hasStop} onChange={(e) => set("hasStop", e.target.checked)} /><span style={{ color: C.sky }}>One stopover</span>
               </label>
               {inp.hasStop && (
                 <>
                   <Field label="Stopover city"><ZonePicker value={inp.stopZone} dateYmd={String(inp.stopArrive || inp.depart).split("T")[0]} onPick={(z) => pickZone("stop", z)} /></Field>
-                  <Field label="Leg 1 arrival (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.stopArrive} onChange={(e) => set("stopArrive", e.target.value)} /></Field>
-                  <Field label="Leg 2 departure (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.stopDepart} onChange={(e) => set("stopDepart", e.target.value)} /></Field>
+                  <Field label="Leg 1 arrival (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.stopArrive} onChange={(e) => setTime("stopArrive", e.target.value)} /></Field>
+                  <Field label="Leg 2 departure (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.stopDepart} onChange={(e) => setTime("stopDepart", e.target.value)} /></Field>
                 </>
               )}
               <details>
@@ -758,16 +817,16 @@ export default function CircadianShift() {
             {inp.roundTrip && (
               <Section title="Return" open={sec.ret} onToggle={() => tog("ret")} alert={retAlert}
                 summary={`${destCity} → ${inp.retHasStop ? cityOf(inp.retStopZone, inp.retStopOffset) + " → " : ""}${homeCity} · ${Number.isFinite(parseUTC(inp.retDepart, inp.destOffset)) ? dateAt(parseUTC(inp.retDepart, inp.destOffset), inp.destOffset) : "no date"}`}>
-                <Field label={`Departure (${destCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.retDepart} onChange={(e) => set("retDepart", e.target.value)} /></Field>
-                <Field label={`Arrival (${homeCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.retArrive} onChange={(e) => set("retArrive", e.target.value)} /></Field>
+                <Field label={`Departure (${destCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.retDepart} onChange={(e) => setTime("retDepart", e.target.value)} /></Field>
+                <Field label={`Arrival (${homeCity} time)`}><input type="datetime-local" style={inputStyle} value={inp.retArrive} onChange={(e) => setTime("retArrive", e.target.value)} /></Field>
                 <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
                   <input type="checkbox" checked={inp.retHasStop} onChange={(e) => set("retHasStop", e.target.checked)} /><span style={{ color: C.sky }}>One stopover</span>
                 </label>
                 {inp.retHasStop && (
                   <>
                     <Field label="Stopover city"><ZonePicker value={inp.retStopZone} dateYmd={String(inp.retStopArrive || inp.retDepart).split("T")[0]} onPick={(z) => pickZone("retStop", z)} /></Field>
-                    <Field label="Leg 1 arrival (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.retStopArrive} onChange={(e) => set("retStopArrive", e.target.value)} /></Field>
-                    <Field label="Leg 2 departure (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.retStopDepart} onChange={(e) => set("retStopDepart", e.target.value)} /></Field>
+                    <Field label="Leg 1 arrival (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.retStopArrive} onChange={(e) => setTime("retStopArrive", e.target.value)} /></Field>
+                    <Field label="Leg 2 departure (stopover time)"><input type="datetime-local" style={inputStyle} value={inp.retStopDepart} onChange={(e) => setTime("retStopDepart", e.target.value)} /></Field>
                   </>
                 )}
               </Section>
@@ -857,10 +916,10 @@ export default function CircadianShift() {
               </button>
               {showNotes && (
                 <div style={{ color: C.dim, fontSize: 12.5, lineHeight: 1.65, marginTop: 10 }}>
-                  <p style={{ marginTop: 0 }}><b style={{ color: C.text }}>Clocks.</b> Every time is shown in the clock in force at that moment: home until the outbound flight lands, destination through the stay, home again once the return lands. The timeline inserts a header at every local midnight and a green header where the clocks change. A card that spans a landing says so, and any row in the other zone carries that city's name.</p>
+                  <p style={{ marginTop: 0 }}><b style={{ color: C.text }}>Clocks.</b> Daylight-saving changes are taken from each city's time zone rules, and the plan starts from the home clock you are actually living on when it begins. Every time is shown in the clock in force at that moment: home until the outbound flight lands, destination through the stay, home again once the return lands. The timeline inserts a header at every local midnight and a green header where the clocks change. A card that spans a landing says so, and any row in the other zone carries that city's name.</p>
                   <p><b style={{ color: C.text }}>Checks.</b> Arrivals before departures, a return that leaves before you land, or journeys over 40 hours raise a warning at the top. An invalid return leg is ignored rather than allowed to corrupt the clock timeline.</p>
                   <p><b style={{ color: C.text }}>Round trips.</b> The return is a second, independent adaptation with its own direction and head start. The head start is capped by the full days spent at the destination. Between the two, the plan is ordinary steady sleep at destination time.</p>
-                  <p><b style={{ color: C.text }}>Flights and stopovers.</b> No sleep in the first or last {BUF} minutes of each flight, or during transit and boarding at a stopover. Sleep is split around every such window, fragments under 45 minutes are dropped, and where a window eats into biological night a darkness cue is added.</p>
+                  <p><b style={{ color: C.text }}>Flights and stopovers.</b> No sleep in the {PREDEP / 60} hours before each journey's first take-off, the first or last {BUF} minutes of each flight, transit and boarding at a stopover, or the hour after landing. Sleep is split around every such window, fragments under 45 minutes are dropped, and where a window eats into biological night a darkness cue is added.</p>
                   <p><b style={{ color: C.text }}>Light and sleep aid.</b> Tmin sits 2 h before wake, adjusted by chronotype. Light after Tmin advances, before Tmin delays, and light windows are clipped to waking hours. Melatonin is shown as a sleep aid only, since evening melatonin phase-advances and would oppose a delay.</p>
                   <p style={{ marginBottom: 0 }}><b style={{ color: C.text }}>Rates.</b> Advance and delay rates are tunable. The E/W crossover is 24·a/(d+a): below it an eastward trip advances, above it the model delays the long way round.</p>
                 </div>

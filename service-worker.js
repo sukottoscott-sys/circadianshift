@@ -1,6 +1,6 @@
 // Network-first with cache fallback: the current deploy whenever online, the last
 // cached copy when offline or when the network stalls past NET_TIMEOUT.
-const CACHE_NAME = "circadianshift-v11";
+const CACHE_NAME = "circadianshift-v12";
 const ASSETS = ["./", "./index.html", "./manifest.json", "./icon-180.png", "./icon-512.png"];
 const NET_TIMEOUT = 3000;
 
